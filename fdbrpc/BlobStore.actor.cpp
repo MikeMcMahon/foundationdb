@@ -126,12 +126,13 @@ Reference<BlobStoreEndpoint> BlobStoreEndpoint::fromString(std::string const &ur
 
 	try {
 		StringRef t(url);
-		StringRef prefix = t.eat("://");
-		if(prefix != LiteralStringRef("blobstore"))
-			throw std::string("Invalid blobstore URL.");
-		StringRef cred   =   t.eat("@");
-		StringRef hostPort = t.eat("/");
-		StringRef resource = t.eat("?");
+        StringRef prefix = t.eat("://");
+        if(prefix != LiteralStringRef("blobstore") && prefix != LiteralStringRef("s3")) {
+            throw std::string("Invalid blobstore URL.");
+        }
+        StringRef cred   =   t.eat("@");
+        StringRef hostPort = t.eat("/");
+        StringRef resource = t.eat("?");
 
 		// hostPort is at least a host or IP address, optionally followed by :portNumber or :serviceName
 		StringRef h(hostPort);
@@ -171,7 +172,24 @@ Reference<BlobStoreEndpoint> BlobStoreEndpoint::fromString(std::string const &ur
 		throw backup_invalid_url();
 	}
 }
+std::string BlobStoreEndpoint::getS3ResourceURL(std::string path, std::string bucket, std::string resource) {
+    std::string hostPort = host;
+    if (!service.empty()) {
+        hostPort.append(":");
+        hostPort.append(service);
+    }
 
+    // if secret isn't being looked up from credentials files then it was passed explicitly in the URL so show it here.
+    std::string s;
+    if (!lookupSecret)
+        s = std::string(":") + secret;
+
+    std::string r = format("s3://%s%s@%s/%s/%s?backupName=%s", key.c_str(), s.c_str(), hostPort.c_str(), bucket.c_str(), path.c_str(), resource.c_str());
+    std::string p = knobs.getURLParameters();
+    if (!p.empty())
+        r.append("&").append(p);
+    return r;
+}
 std::string BlobStoreEndpoint::getResourceURL(std::string resource) {
 	std::string hostPort = host;
 	if(!service.empty()) {
@@ -267,18 +285,6 @@ ACTOR Future<Void> deleteRecursively_impl(Reference<BlobStoreEndpoint> b, std::s
 
 Future<Void> BlobStoreEndpoint::deleteRecursively(std::string const &bucket, std::string prefix, int *pNumDeleted) {
 	return deleteRecursively_impl(Reference<BlobStoreEndpoint>::addRef(this), bucket, prefix, pNumDeleted);
-}
-
-ACTOR Future<Void> createBucket_impl(Reference<BlobStoreEndpoint> b, std::string bucket) {
-	std::string resource = std::string("/") + bucket;
-	HTTP::Headers headers;
-
-	Reference<HTTP::Response> r = wait(b->doRequest("PUT", resource, headers, NULL, 0, {200, 409}));
-	return Void();
-}
-
-Future<Void> BlobStoreEndpoint::createBucket(std::string const &bucket) {
-	return createBucket_impl(Reference<BlobStoreEndpoint>::addRef(this), bucket);
 }
 
 ACTOR Future<int64_t> objectSize_impl(Reference<BlobStoreEndpoint> b, std::string bucket, std::string object) {

@@ -116,6 +116,9 @@ public:
 	// Get a normalized version of this URL with the given resource and any non-default BlobKnob values as URL parameters.
 	std::string getResourceURL(std::string resource);
 
+	// Get an S3 normalized version of this URL with the given resource and any non-default BlobKnob values as URL parameters.
+	std::string getS3ResourceURL(std::string path, std::string bucket, std::string resource);
+
 	struct ReusableConnection {
 		Reference<IConnection> conn;
 		double expirationTime;
@@ -191,9 +194,6 @@ public:
 	// Since it can take a while, if a pNumDeleted is provided then it will be incremented every time
 	// a deletion of an object completes.
 	Future<Void> deleteRecursively(std::string const &bucket, std::string prefix = "", int *pNumDeleted = NULL);
-
-	// Create a bucket if it does not already exists.
-	Future<Void> createBucket(std::string const &bucket);
 
 	// Useful methods for working with tiny files
 	Future<std::string> readEntireFile(std::string const &bucket, std::string const &object);

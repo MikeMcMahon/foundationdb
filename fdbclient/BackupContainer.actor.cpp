@@ -267,8 +267,10 @@ public:
 		// Read the range file list for the specified version range, and then index them by fileName.
 		std::vector<RangeFile> files = wait(bc->listRangeFiles(snapshot.beginVersion, snapshot.endVersion));
 		state std::map<std::string, RangeFile> rangeIndex;
-		for(auto &f : files)
-			rangeIndex[f.fileName] = std::move(f);
+		for(auto &f : files) {
+            printf("range file: %s", f.fileName.c_str());
+            rangeIndex[f.fileName] = std::move(f);
+        }
 
 		// Read the snapshot file, verify the version range, then find each of the range files by name in the index and return them.
 		state Reference<IAsyncFile> f = wait(bc->readFile(snapshot.fileName));
@@ -995,9 +997,6 @@ private:
 
 class BackupContainerBlobStore : public BackupContainerFileSystem, ReferenceCounted<BackupContainerBlobStore> {
 private:
-	// All backup data goes into a single bucket
-	static const std::string BUCKET;
-
 	// Backup files to under a single folder prefix with subfolders for each named backup
 	static const std::string DATAFOLDER;
 
@@ -1007,19 +1006,31 @@ private:
 
 	Reference<BlobStoreEndpoint> m_bstore;
 	std::string m_name;
+	std::string m_bucket;
+
+	// blank for blobstore but for s3 can specify a supdirectory
+	std::string m_path;
 
 	std::string dataPath(const std::string path) {
-		return DATAFOLDER + "/" + m_name + "/" + path;
+		if (m_path.empty())
+			return DATAFOLDER + "/" + m_name + "/" + path;
+		return m_path + "/" + DATAFOLDER + "/" + m_name + "/" + path;
 	}
 
 	// Get the path of the backups's index entry
 	std::string indexEntry() {
-		return INDEXFOLDER + "/" + m_name;
+		if (m_path.empty())
+			return INDEXFOLDER + "/" + m_name;
+		return m_path + "/" + INDEXFOLDER + "/" + m_name;
 	}
 
 public:
 	BackupContainerBlobStore(Reference<BlobStoreEndpoint> bstore, std::string name)
-	  : m_bstore(bstore), m_name(name) {
+	  : m_bstore(bstore), m_name(name), m_bucket("FDB_BACKUPS_V2"), m_path("") {
+	}
+
+	BackupContainerBlobStore(Reference<BlobStoreEndpoint> bstore, std::string name, std::string path, std::string bucket)
+			: m_bstore(bstore), m_name(name), m_bucket(bucket), m_path(path) {
 	}
 
 	void addref() { return ReferenceCounted<BackupContainerBlobStore>::addref(); }
@@ -1032,7 +1043,7 @@ public:
 	Future<Reference<IAsyncFile>> readFile(std::string path) {
 			return Reference<IAsyncFile>(
 				new AsyncFileReadAheadCache(
-					Reference<IAsyncFile>(new AsyncFileBlobStoreRead(m_bstore, BUCKET, dataPath(path))),
+					Reference<IAsyncFile>(new AsyncFileBlobStoreRead(m_bstore, m_bucket, dataPath(path))),
 					m_bstore->knobs.read_block_size,
 					m_bstore->knobs.read_ahead_blocks,
 					m_bstore->knobs.concurrent_reads_per_file,
@@ -1041,14 +1052,100 @@ public:
 			);
 	}
 
-	ACTOR static Future<std::vector<std::string>> listURLs(Reference<BlobStoreEndpoint> bstore) {
+	ACTOR static Future<std::vector<std::string>> listURLs(Reference<BlobStoreEndpoint> bstore, std::string bucket) {
 		state std::string basePath = INDEXFOLDER + '/';
-		BlobStoreEndpoint::ListResult contents = wait(bstore->listBucket(BUCKET, basePath));
+		BlobStoreEndpoint::ListResult contents = wait(bstore->listBucket(bucket, basePath));
 		std::vector<std::string> results;
 		for(auto &f : contents.objects) {
 			results.push_back(bstore->getResourceURL(f.name.substr(basePath.size())));
 		}
 		return results;
+	}
+
+	ACTOR static Future<std::vector<std::string>> listURLs(Reference<BlobStoreEndpoint> bstore, std::string bucket, std::string s3Path) {
+		state std::string basePath = s3Path + "/" + INDEXFOLDER + '/';
+		BlobStoreEndpoint::ListResult contents = wait(bstore->listBucket(bucket, basePath));
+		std::vector<std::string> results;
+		for(auto &f : contents.objects) {
+			results.push_back(bstore->getS3ResourceURL(s3Path, bucket, f.name.substr(basePath.size())));
+		}
+		return results;
+	}
+
+	static std::string getS3URLParts(std::string baseURL, std::string *bucketFromURL, std::string *pathFromURL, std::string *backupNameFromURL, std::string *lastOpenError) {
+		if (bucketFromURL) {
+			bucketFromURL->clear();
+		}
+		if (pathFromURL) {
+			pathFromURL->clear();
+		}
+		if (backupNameFromURL) {
+			backupNameFromURL->clear();
+		}
+		if (lastOpenError) {
+			lastOpenError->clear();
+		}
+
+		const std::string parameter("backupName=");
+
+		// Backup name has to be specified
+		if (backupNameFromURL && baseURL.find(parameter) == std::string::npos) {
+			*lastOpenError = "Backup name must be specified.";
+			throw backup_invalid_url();
+		}
+
+		// The bucketName has to be specified in some capacity...
+		if (baseURL.rfind("/") == std::string::npos) {
+			*lastOpenError = "bucket name must be specified.";
+			throw backup_invalid_url();
+		}
+
+		// Essentially grabs from the first / to the ? (which has to be specified and if it is not will get the npos and go boom)
+		size_t loffset = baseURL.find("/", std::string("s3://").size()) + 1;
+		size_t roffset = baseURL.rfind("?") - loffset;
+
+		std::string bucketNameAndPath = baseURL.substr(loffset, roffset);
+		StringRef b(bucketNameAndPath);
+		StringRef bucketName = b.eat("/");
+		StringRef bucketPath = b.eat();
+
+		if (bucketPath.endsWith(LiteralStringRef("/")))
+			bucketPath = bucketPath.substr(0, bucketPath.size() - 1);
+
+		if (bucketFromURL != nullptr) {
+			*bucketFromURL = bucketName.toString();
+		}
+
+		// Strip out the /bucketName we will provide that to the BackupContainerBlobStore directly later
+		baseURL = baseURL.replace(loffset - 1, bucketName.size() + 1, "");
+
+		if (bucketPath.size() != 0) {
+			if (pathFromURL != nullptr)
+				*pathFromURL = bucketPath.toString();
+		} else {
+			*pathFromURL = std::string("");
+		}
+
+		// If we don't supply a backupName don't check for a backupName
+		if (backupNameFromURL) {
+			// Chomp the string from backupName to the end and then we'll trim off anything extra
+			size_t bPos = baseURL.find(parameter);
+			std::string rawBackupName = baseURL.substr(bPos);
+
+			StringRef n(rawBackupName);
+			std::string backupName;
+			backupName = n.eat("&").toString();
+			if (n.size() == 0)
+				baseURL.replace(bPos - 1, backupName.size() + 1, "");
+			else
+				baseURL.replace(bPos, backupName.size() + 1, "");
+
+			backupName = backupName.replace(0, parameter.size(), "");
+			if (backupNameFromURL != nullptr)
+				*backupNameFromURL = backupName;
+		}
+
+		return baseURL;
 	}
 
 	class BackupFile : public IBackupFile, ReferenceCounted<BackupFile> {
@@ -1073,11 +1170,11 @@ public:
 	};
 
 	Future<Reference<IBackupFile>> writeFile(std::string path) {
-		return Reference<IBackupFile>(new BackupFile(path, Reference<IAsyncFile>(new AsyncFileBlobStoreWrite(m_bstore, BUCKET, dataPath(path)))));
+		return Reference<IBackupFile>(new BackupFile(path, Reference<IAsyncFile>(new AsyncFileBlobStoreWrite(m_bstore, m_bucket, dataPath(path)))));
 	}
 
 	Future<Void> deleteFile(std::string path) {
-		return m_bstore->deleteObject(BUCKET, dataPath(path));
+		return m_bstore->deleteObject(m_bucket, dataPath(path));
 	}
 
 	ACTOR static Future<FilesAndSizesT> listFiles_impl(Reference<BackupContainerBlobStore> bc, std::string path, std::function<bool(std::string const &)> pathFilter) {
@@ -1089,7 +1186,7 @@ public:
 			return pathFilter(folderPath.substr(prefixTrim));
 		};
 
-		state BlobStoreEndpoint::ListResult result = wait(bc->m_bstore->listBucket(BUCKET, bc->dataPath(path), '/', std::numeric_limits<int>::max(), rawPathFilter));
+		state BlobStoreEndpoint::ListResult result = wait(bc->m_bstore->listBucket(bc->m_bucket, bc->dataPath(path), '/', std::numeric_limits<int>::max(), rawPathFilter));
 		FilesAndSizesT files;
 		for(auto &o : result.objects) {
 			ASSERT(o.name.size() >= prefixTrim);
@@ -1103,12 +1200,10 @@ public:
 	}
 
 	ACTOR static Future<Void> create_impl(Reference<BackupContainerBlobStore> bc) {
-		Void _ = wait(bc->m_bstore->createBucket(BUCKET));
-
 		// Check/create the index entry
-		bool exists = wait(bc->m_bstore->objectExists(BUCKET, bc->indexEntry()));
+		bool exists = wait(bc->m_bstore->objectExists(bc->m_bucket, bc->indexEntry()));
 		if(!exists) {
-			Void _ = wait(bc->m_bstore->writeEntireFile(BUCKET, bc->indexEntry(), ""));
+			Void _ = wait(bc->m_bstore->writeEntireFile(bc->m_bucket, bc->indexEntry(), ""));
 		}
 
 		return Void();
@@ -1120,10 +1215,10 @@ public:
 
 	ACTOR static Future<Void> deleteContainer_impl(Reference<BackupContainerBlobStore> bc, int *pNumDeleted) {
 		// First delete everything under the data prefix in the bucket
-		Void _ = wait(bc->m_bstore->deleteRecursively(BUCKET, bc->dataPath(""), pNumDeleted));
+		Void _ = wait(bc->m_bstore->deleteRecursively(bc->m_bucket, bc->dataPath(""), pNumDeleted));
 
 		// Now that all files are deleted, delete the index entry
-		Void _ = wait(bc->m_bstore->deleteObject(BUCKET, bc->indexEntry()));
+		Void _ = wait(bc->m_bstore->deleteObject(bc->m_bucket, bc->indexEntry()));
 
 		return Void();
 	}
@@ -1133,7 +1228,6 @@ public:
 	}
 };
 
-const std::string BackupContainerBlobStore::BUCKET = "FDB_BACKUPS_V2";
 const std::string BackupContainerBlobStore::DATAFOLDER = "data";
 const std::string BackupContainerBlobStore::INDEXFOLDER = "backups";
 
@@ -1149,7 +1243,7 @@ std::vector<std::string> IBackupContainer::getURLFormats() {
 // Get an IBackupContainer based on a container URL string
 Reference<IBackupContainer> IBackupContainer::openContainer(std::string url)
 {
-	static std::map<std::string, Reference<IBackupContainer>> m_cache;
+    static std::map<std::string, Reference<IBackupContainer>> m_cache;
 
 	Reference<IBackupContainer> &r = m_cache[url];
 	if(r)
@@ -1167,8 +1261,38 @@ Reference<IBackupContainer> IBackupContainer::openContainer(std::string url)
 			for(auto c : resource)
 				if(!isalnum(c) && c != '_' && c != '-' && c != '.' && c != '/')
 					throw backup_invalid_url();
+
 			r = Reference<IBackupContainer>(new BackupContainerBlobStore(bstore, resource));
 		}
+        else if (u.startsWith(LiteralStringRef("s3://"))) {
+            // Get the bucketName from the URL and shift it down
+            // get the backupName from the URL params and store it for later use
+            // s3://credentials@s3-us-west-2.amazonaws.com/bucketName/path/?[backupName|knobs]=...
+            std::string resource;
+			std::string backupName;
+			std::string bucketName;
+			std::string bucketPath;
+            std::string bstoreUrl;
+
+			bstoreUrl = BackupContainerBlobStore::getS3URLParts(url, &bucketName, &bucketPath, &backupName, &lastOpenError);
+
+            printf("bucket: %s\n", bucketName.c_str());
+			printf("  path: %s\n", bucketPath.c_str());
+			printf(" bName: %s\n", backupName.c_str());
+
+			if (backupName.empty())
+				throw backup_invalid_url();
+
+            Reference<BlobStoreEndpoint> bstore = BlobStoreEndpoint::fromString(bstoreUrl, &resource, &lastOpenError);
+            if (resource.empty())
+                throw backup_invalid_url();
+
+            for (auto c : resource)
+                if (!isalnum(c) && c != '_' && c != '-' && c != '.' && c != '/')
+                    throw backup_invalid_url();
+
+            r = Reference<IBackupContainer>(new BackupContainerBlobStore(bstore, backupName, bucketPath, bucketName));
+        }
 		else {
 			lastOpenError = "invalid URL prefix";
 			throw backup_invalid_url();
@@ -1206,7 +1330,19 @@ ACTOR Future<std::vector<std::string>> listContainers_impl(std::string baseURL) 
 				throw backup_invalid_url();
 			}
 
-			std::vector<std::string> results = wait(BackupContainerBlobStore::listURLs(bstore));
+			std::vector<std::string> results = wait(BackupContainerBlobStore::listURLs(bstore, "FDB_BACKUPS_V2"));
+			return results;
+		}
+		else if (u.startsWith(LiteralStringRef("s3://"))) {
+			std::string resource;
+			std::string bucketName;
+			std::string bucketPath;
+			std::string bstoreURL;
+
+			bstoreURL = BackupContainerBlobStore::getS3URLParts(baseURL, &bucketName, &bucketPath, NULL, &IBackupContainer::lastOpenError);
+			Reference<BlobStoreEndpoint> bstore = BlobStoreEndpoint::fromString(bstoreURL, &resource, &IBackupContainer::lastOpenError);
+
+			std::vector<std::string> results = wait(BackupContainerBlobStore::listURLs(bstore, bucketName, bucketPath));
 			return results;
 		}
 		else {
